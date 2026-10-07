@@ -1,0 +1,90 @@
+name: Pinned PHP maintenance validation
+on:
+  push:
+    branches: [validation/merge-wave-20261007]
+    paths: [.github/workflows/merge-wave-validation.yml]
+permissions:
+  contents: read
+env:
+  BASE_SHA: 86be718f933419c2049c847e9afd78ecc45b19f5
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - {pr: 102, head: 32b31c78ff8a401f195a1d3ba7ffd86414228acf, test: tests/Lib/Tools/BetaMcpTest.php}
+          - {pr: 104, head: 8c96eb7f4107e8fdd8ad5bd1a6033e3403e3fbf8, test: tests/Lib/Tools/BetaToolRunnerTest.php}
+          - {pr: 106, head: bf4917f07f6f4ad76363eedafde9492b07051b14, test: tests/Core/EmptyStructuredSchemaTest.php}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ matrix.head }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Merge the pinned current base without changing the PR branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -c core.hooksPath=/dev/null merge --no-commit --no-ff "$BASE_SHA"
+          git diff --cached --check
+          git write-tree
+      - uses: shivammathur/setup-php@accd6127cb78bee3e8082180cb391013d204ef9f
+        with:
+          php-version: '8.3'
+          coverage: none
+          tools: composer:v2
+      - name: Install the declared development dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+      - name: Run the affected mock-transport tests
+        env:
+          TEST_FILE: ${{ matrix.test }}
+        run: |
+          php vendor/bin/phpunit --bootstrap vendor/autoload.php --log-junit "$RUNNER_TEMP/results.xml" "$TEST_FILE"
+          python3 - "$RUNNER_TEMP/results.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          for suite in ET.parse(sys.argv[1]).getroot().iter('testsuite'):
+              print('REGRESSION_SUMMARY', suite.attrib)
+          PY
+      - name: Validate changed PHP syntax
+        run: |
+          git diff --name-only "$BASE_SHA" -- '*.php' | while IFS= read -r file; do php -l "$file"; done
+  preserve_candidates:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    strategy:
+      max-parallel: 2
+      matrix:
+        include:
+          - {pr: 102, head: 32b31c78ff8a401f195a1d3ba7ffd86414228acf}
+          - {pr: 104, head: 8c96eb7f4107e8fdd8ad5bd1a6033e3403e3fbf8}
+          - {pr: 106, head: bf4917f07f6f4ad76363eedafde9492b07051b14}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ matrix.head }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reconstruct the tested candidate without running source code
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -c core.hooksPath=/dev/null merge --no-commit --no-ff "$BASE_SHA"
+          git diff --cached --check
+          git -c core.hooksPath=/dev/null commit -m 'Merge current main after focused PHP regression validation'
+      - name: Publish only a candidate branch for inspection
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ matrix.pr }}
+        run: |
+          candidate="validation/merge-wave-20261007-pr-${PR_NUMBER}"
+          gh auth setup-git
+          test -z "$(git ls-remote --heads origin "$candidate")"
+          git push origin "HEAD:refs/heads/$candidate"
+          echo "VALIDATED_CANDIDATE $candidate $(git rev-parse HEAD)"
